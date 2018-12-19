@@ -11,14 +11,19 @@
 using namespace std;
 int numOfSeats; // number of seats
 int *assignments; // results will be written here
-void createClients();
 void * clientThread(void*);
 void * serverThread(void*);
 pthread_mutex_t arriveMutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t serverIdReceiveMutex = PTHREAD_MUTEX_INITIALIZER;
-sem_t s; // For server client enumeration synchronization.
+pthread_mutex_t replacementMutex = PTHREAD_MUTEX_INITIALIZER;
+
+sem_t srv; // For server client enumeration synchronization.
+sem_t * cli; // For client to select again
 int arrivalCounter = 1;
 vector<pthread_mutex_t> mutexs;
+
+int * selectionArray;
+
+
 
 int main(int argc, char** argv) {
     void *status; // status returned from threads
@@ -40,16 +45,35 @@ int main(int argc, char** argv) {
     // basic input process into seats integer ^
 
     vector<pthread_t> myThreads;
-    assignments = (int *) malloc(sizeof(int)*numOfSeats);
+    assignments = (int *) calloc(numOfSeats,sizeof(int));
     if(!assignments){
-        cerr << "Could not allocate memory with malloc for assignments array" << endl;
+        cerr << "Could not allocate memory with calloc for assignments array" << endl;
         exit(1);
     }
     for(int x = 1; x  <= numOfSeats; x++) {
         mutexs.push_back(PTHREAD_MUTEX_INITIALIZER);
     }
-    if (sem_init(&s,0,0) == -1)
+    if (sem_init(&srv,0,0) == -1)
         printf("%s\n",strerror(errno));
+
+    selectionArray  = (int*) calloc(numOfSeats,sizeof(int));
+    if(!selectionArray){
+        fprintf(stderr,"Unable to allocate memory for selection array, cannot proceed");
+        exit(1);
+    }
+    if (sem_init(&srv,0,0) == -1)
+        printf("%s\n",strerror(errno));
+
+
+    cli  = (sem_t*) calloc(numOfSeats,sizeof(sem_t));
+    if(!cli){
+        fprintf(stderr,"Unable to allocate memory for cli semaphor array, cannot proceed");
+        exit(1);
+    }
+    for(int i = 0;i< numOfSeats;i++){
+        if (sem_init(&cli[i],0,1) == -1)
+            printf("%s\n",strerror(errno));
+    }
     // Some initialization ^
 
     pthread_attr_t attr;
@@ -77,23 +101,21 @@ int main(int argc, char** argv) {
     }
     // Wait for them to finish by joining ^
 
-   /* cout << "Number of total seats: " << numOfSeats << endl;
+    cout << "Number of total seats: " << numOfSeats << endl;
     for(int x = 0; x < numOfSeats; x++){
         cout << "Client" << x+1 << " reserves Seat" << assignments[numOfSeats] << endl;
     }
-    cout << "All seats are reserved." << endl;*/
+    cout << "All seats are reserved." << endl;
     // Output ^
 
     pthread_mutex_destroy(&arriveMutex);
     pthread_exit(0);
-    return 0;
 }
 
 void * clientThread(void * param){
 
     int rc;
     //source:  http://www.cplusplus.com/reference/random/uniform_int_distribution/operator()
-
     // construct a trivial random generator engine from a time-based seed
     unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
     default_random_engine generator(seed);
@@ -103,38 +125,57 @@ void * clientThread(void * param){
     pthread_t server;
 
     pthread_mutex_lock(&arriveMutex);
-    int *myId = (int*) malloc(sizeof(int));
+    int *myId = (int*) calloc(1,sizeof(int));
+    if(!myId){
+        fprintf(stderr,"Unable to allocate memory for id integer, cannot proceed");
+        exit(1);
+    }
     *myId = arrivalCounter;
     rc = pthread_create(&server, nullptr,serverThread,myId);
+    // Create associated server, pass the client id according to arrive time starting from 1
+
     if (rc) {
         printf("ERROR; return code from pthread_create() in client is %d\n", rc);
         exit(-1);
     }
-    if (sem_wait(&s) != 0)
+    if (sem_wait(&srv) != 0)
         printf("%s\n",strerror(errno));
     pthread_mutex_unlock(&arriveMutex);
 
-    uniform_int_distribution<int> seatSelectorDist(1,numOfSeats);
-    int selectedSeat = seatSelectorDist(generator);
+    while(true){
+        if (sem_wait(&cli[*myId-1]) != 0)
+            printf("%s\n",strerror(errno));
+
+        uniform_int_distribution<int> seatSelectorDist(1,numOfSeats);
+        int selectedSeat = seatSelectorDist(generator);
+        selectionArray[*myId-1] = selectedSeat;
 
 
-
-
-    // Create associated server, pass the client id according to arrive time starting from 1
-
-   // cout << "Thread created, Time sleeped is: " << timeToSleep <<   endl;
-    pthread_exit(nullptr);
+        if(assignments[*myId-1])
+            pthread_exit(nullptr);
+    }
 }
 void * serverThread(void * clientId){
 
     int id = *(int*)clientId;
     arrivalCounter++;
     free(clientId);
-    if (sem_post(&s) != 0)
+    if (sem_post(&srv) != 0)
         printf("%s\n",strerror(errno));
 
-
-    cout << "I am server thread for client " << id << endl;
-    pthread_exit(0);
+    while(true){
+        if(selectionArray[id-1]) {
+            pthread_mutex_lock(&replacementMutex);
+            if(!assignments[selectionArray[id-1]-1]){
+                assignments[selectionArray[id-1]-1] = id;
+            }else{
+                selectionArray[id-1] = 0;
+                if (sem_post(&cli[id-1]) != 0)
+                    printf("%s\n",strerror(errno));
+            }
+            pthread_mutex_unlock(&replacementMutex);
+            pthread_exit(nullptr);
+        }
+    }
 }
 
